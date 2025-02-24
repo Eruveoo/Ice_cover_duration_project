@@ -1,0 +1,127 @@
+---
+title: "Lakes and stations on map"
+author: "Kuura Variskallio"
+date: "2/18/2025"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE}
+setwd("~/Documents/School/2025/dsp/ice-loss/")
+DATADIR <- "./client/Data/"
+
+library(tidyverse)
+library(FactoMineR)
+library(factoextra)
+library(GGally)
+library(ggplot2)
+library(dplyr)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+```
+
+
+## Pairwise plots of lake params
+
+```{r}
+ltbl_ice <- read_rds(paste0(DATADIR, "ltbl_ice.rds"))
+
+(lake_num <- ltbl_ice %>% 
+  select(-one_of(c('lake_id', 'station_id', 'country', 'subset', 'lake_name'))))[1:6, ]
+```
+
+```{r}
+ltbl_ice %>%
+  summarise_at(vars(lake_id, station_id, country, subset, lake_name), n_distinct)
+```
+
+```{r}
+ltbl_ice %>% 
+  group_by(country) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+```
+
+
+```{r}
+ltbl_ice %>% 
+  group_by(subset) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+```
+
+```{r  fig.width=10, warning=FALSE}
+# limit to Fennoscandia
+lake_fs_num <- lake_num %>%
+  filter(lon_wgs84 > 0)
+
+# ignore missing values for now
+ggpairs(lake_fs_num, mapping = aes(alpha = 0.3), 
+             lower = list(combo = wrap("facethist", bins = 20)),  
+             upper = list(continuous = wrap("cor", size = 3)))
+```
+
+## Lakes on map
+
+Get map data.
+```{r results='hide'}
+fs_maps <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  filter(name %in% c("Sweden", "Finland", "Norway"))
+
+lakes <- ne_load(scale = 10, type = "lakes", destdir = "maps")
+```
+
+Lakes and station (?) coords.
+
+```{r}
+ggplot() +
+  geom_sf(data = fs_maps) +
+  geom_sf(data = lakes, fill = "lightblue", color = NA) +
+  geom_point(data = lake_fs_num, aes(x = lon_wgs84, y = lat_wgs84), 
+             color = "red", size = 1, alpha=0.5) +
+  coord_sf(xlim = c(4, 32), ylim = c(55, 72)) +
+  theme_minimal() +
+  labs(title = "Lake Locations") +
+  xlab("") + 
+  ylab("")
+
+# ggsave("images/lake-locations-with-lakes-fs.pdf", plot = g, bg = "transparent")
+
+# figure margins: https://stackoverflow.com/questions/67687029/
+```
+
+
+Lakes, station (?) coords and lake cent coords.
+
+```{r warning=FALSE}
+# plot shifs in coordinates
+# omit nan rows
+
+lake_fs_num_shift <- lake_fs_num %>%
+  filter(if_all(c(lon_wgs84, lat_wgs84, cent_lon_wgs84, cent_lat_wgs84), ~!is.na(.)))
+
+
+ggplot() +
+  geom_sf(data = fs_maps) +
+  geom_sf(data = lakes, fill = "lightblue", color = NA) +
+  geom_point(data = lake_fs_num_shift, aes(x = lon_wgs84, y = lat_wgs84), 
+              color = "red", size = 1, alpha=0.5) +
+  geom_point(data = lake_fs_num_shift, aes(x = cent_lon_wgs84, y = cent_lat_wgs84), 
+              color = "blue", size = 1, alpha=0.1) +
+  geom_segment(data = lake_fs_num_shift, 
+               aes(x = lon_wgs84, y = lat_wgs84, xend = cent_lon_wgs84, yend = cent_lat_wgs84), 
+               color = "black", size = 0.25) +
+  coord_sf(xlim = c(4, 32), ylim = c(55, 72)) +
+  theme_minimal() +
+  xlab("") + 
+  ylab("")
+```
+
+
