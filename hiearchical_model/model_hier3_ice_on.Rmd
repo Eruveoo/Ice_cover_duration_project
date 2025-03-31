@@ -1,0 +1,597 @@
+---
+title: "Hiearchical Ice on model"
+output: pdf_document
+---
+
+```{r, message = FALSE}
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(recipes)
+library(readr)
+library(rstan)
+library(ggplot2)
+library(reshape2)
+
+data_ip <- read_csv("data_ip.csv")
+lake_data <- read_csv("ltbl_ice.csv")
+```
+
+```{r}
+merged_data <- left_join(data_ip, lake_data, by = "station_id")
+
+merged_data <- merged_data %>%
+  mutate(
+    year_ice_on = year(ice_on),
+    ice_on_doy = yday(ice_on),
+    # Add 365 to DOY if ice_on happens in the year after the lake season year
+    ice_on_doy = if_else(year_ice_on > year - 1, ice_on_doy + 365, ice_on_doy)
+  ) %>%
+  filter(!is.na(ice_on)) #& !is.na(ice_off))
+```
+
+```{r}
+features <- c("year", "lat_wgs84", "altitude_m", "area_ha", "country")
+target <- "ice_on_doy"
+
+rec <- recipe(as.formula(paste(target, "~", paste(features, collapse = "+"))), data = merged_data) %>%
+  step_log(area_ha, base = exp(1)) %>%
+  
+  step_range(year, min = -1, max = 1) %>%
+  
+  step_normalize(all_numeric_predictors(), -year) %>%
+  
+  step_dummy(country, one_hot = TRUE)
+```
+
+
+```{r, message=FALSE}
+rec_time <- recipe(ice_on_doy ~ year, data = merged_data) %>%
+  step_range(year, min = -1, max = 1)  # scale year to [-1, 1]
+
+rec_prep <- prep(rec_time, training = merged_data)
+data <- bake(rec_prep, new_data = merged_data)
+
+data$year2 <- data$year^2
+
+stan_data_simple <- list(
+  N = nrow(data),
+  year = data$year,
+  year2 = data$year2,
+  y = data$ice_on_doy
+)
+
+suppress_output <- function(expr) {
+  invisible(capture.output(result <- eval(expr, envir = parent.frame())))
+  result
+}
+```
+
+```{r, message=FALSE}
+library(rstan)
+library(ggplot2)
+library(reshape2)
+library(recipes)
+library(dplyr)
+
+rstan::rstan_options(auto_write = TRUE)
+options(mc.cores = 1)
+
+rec_prep <- prep(rec, training = merged_data)
+data <- bake(rec_prep, new_data = merged_data)
+
+country_vars <- grep("^country_", names(data), value = TRUE)
+
+stan_data_extended <- list(
+  N = nrow(data),
+  C = length(country_vars),
+  year = data$year,
+  year2 = data$year^2,
+  log_area = data$area_ha,
+  altitude = data$altitude_m,
+  latitude = data$lat_wgs84,
+  country = as.matrix(data[, country_vars]),
+  y = data$ice_on_doy
+)
+
+suppress_output <- function(expr) {
+  invisible(capture.output(result <- eval(expr, envir = parent.frame())))
+  result
+}
+```
+
+### 4). **Fully Hierarchical Time Trend Model (Intercept, Linear, and Quadratic Effects)**
+
+In this model, we take the hierarchical approach one step further by allowing **all three time-related parameters** to vary across lakes:
+
+- The **intercept** \( \beta_{0i} \)
+- The **linear time coefficient** \( \beta_{1i} \)
+- The **quadratic time coefficient** \( \beta_{2i} \)
+
+Each of these parameters is modeled as a function of lake-specific environmental features (such as log-transformed area, altitude, latitude, and country), plus random variation.
+
+#### Model structure:
+
+$$
+y_i \sim \mathcal{N}(\mu_i, \sigma^2)
+$$
+
+$$
+\mu_i = \beta_{0i} + \beta_{1i} \cdot \text{year}_i + \beta_{2i} \cdot \text{year}_i^2
+$$
+
+Where:
+
+- \( \beta_{0i} \sim \mathcal{N}(\mu^{(0)}_i, \sigma_{\beta_0}^2) \)
+- \( \beta_{1i} \sim \mathcal{N}(\mu^{(1)}_i, \sigma_{\beta_1}^2) \)
+- \( \beta_{2i} \sim \mathcal{N}(\mu^{(2)}_i, \sigma_{\beta_2}^2) \)
+
+Each mean \( \mu^{(k)}_i \) (for \( k = 0, 1, 2 \)) is defined by environmental covariates:
+
+#### Intercept:
+$$
+\mu^{(0)}_i = w_0 + w_{\text{area}} \cdot \log(\text{area}_i) + w_{\text{alt}} \cdot \text{altitude}_i + w_{\text{lat}} \cdot \text{latitude}_i + \sum_c \gamma^{(0)}_c \cdot \text{country}_{ic}
+$$
+
+#### Linear time effect:
+$$
+\mu^{(1)}_i = v_0 + v_{\text{area}} \cdot \log(\text{area}_i) + v_{\text{alt}} \cdot \text{altitude}_i + v_{\text{lat}} \cdot \text{latitude}_i + \sum_c \gamma^{(1)}_c \cdot \text{country}_{ic}
+$$
+
+#### Quadratic time effect:
+$$
+\mu^{(2)}_i = q_0 + q_{\text{area}} \cdot \log(\text{area}_i) + q_{\text{alt}} \cdot \text{altitude}_i + q_{\text{lat}} \cdot \text{latitude}_i + \sum_c \gamma^{(2)}_c \cdot \text{country}_{ic}
+$$
+
+This model allows each lake to have its own:
+- Baseline ice-on day (\( \beta_{0i} \))
+- Linear trend over time (\( \beta_{1i} \))
+- Nonlinear (accelerating/decelerating) trend over time (\( \beta_{2i} \))
+
+All while sharing information across lakes through environmental structure. This offers maximum flexibility for capturing heterogeneous climate responses across space and time.
+
+```{r}
+stan_model_code_hier3 <- "
+data {
+  int<lower=1> N;
+  int<lower=1> C;
+  vector[N] year;
+  vector[N] year2;
+  vector[N] log_area;
+  vector[N] altitude;
+  vector[N] latitude;
+  matrix[N, C] country;
+  vector[N] y;
+}
+
+parameters {
+  // Intercept model
+  real w0;
+  real w_area;
+  real w_altitude;
+  real w_latitude;
+  vector[C] w_country;
+  real<lower=0> sigma_beta0;
+  vector[N] beta0_raw;
+
+  // Linear slope model
+  real v0;
+  real v_area;
+  real v_altitude;
+  real v_latitude;
+  vector[C] v_country;
+  real<lower=0> sigma_beta1;
+  vector[N] beta1_raw;
+
+  // Quadratic slope model
+  real q0;
+  real q_area;
+  real q_altitude;
+  real q_latitude;
+  vector[C] q_country;
+  real<lower=0> sigma_beta2;
+  vector[N] beta2_raw;
+
+  // Residual SD
+  real<lower=0> sigma;
+}
+
+transformed parameters {
+  vector[N] mu_env_0;     // mean for intercept
+  vector[N] mu_env_1;     // mean for linear slope
+  vector[N] mu_env_2;     // mean for quadratic slope
+
+  vector[N] beta0;
+  vector[N] beta1;
+  vector[N] beta2;
+  vector[N] mu;
+
+  for (i in 1:N) {
+    mu_env_0[i] = w0
+                + w_area * log_area[i]
+                + w_altitude * altitude[i]
+                + w_latitude * latitude[i]
+                + dot_product(w_country, country[i]);
+
+    mu_env_1[i] = v0
+                + v_area * log_area[i]
+                + v_altitude * altitude[i]
+                + v_latitude * latitude[i]
+                + dot_product(v_country, country[i]);
+
+    mu_env_2[i] = q0
+                + q_area * log_area[i]
+                + q_altitude * altitude[i]
+                + q_latitude * latitude[i]
+                + dot_product(q_country, country[i]);
+
+    beta0[i] = mu_env_0[i] + beta0_raw[i] * sigma_beta0;
+    beta1[i] = mu_env_1[i] + beta1_raw[i] * sigma_beta1;
+    beta2[i] = mu_env_2[i] + beta2_raw[i] * sigma_beta2;
+
+    mu[i] = beta0[i] + beta1[i] * year[i] + beta2[i] * year2[i];
+  }
+}
+
+model {
+  // Priors for intercept regression
+  w0 ~ normal(0, 5);
+  w_area ~ normal(0, 2);
+  w_altitude ~ normal(0, 2);
+  w_latitude ~ normal(0, 2);
+  w_country ~ normal(0, 2);
+  sigma_beta0 ~ normal(0, 2);
+  beta0_raw ~ normal(0, 1);
+
+  // Priors for linear slope regression
+  v0 ~ normal(0, 5);
+  v_area ~ normal(0, 2);
+  v_altitude ~ normal(0, 2);
+  v_latitude ~ normal(0, 2);
+  v_country ~ normal(0, 2);
+  sigma_beta1 ~ normal(0, 2);
+  beta1_raw ~ normal(0, 1);
+
+  // Priors for quadratic slope regression
+  q0 ~ normal(0, 5);
+  q_area ~ normal(0, 2);
+  q_altitude ~ normal(0, 2);
+  q_latitude ~ normal(0, 2);
+  q_country ~ normal(0, 2);
+  sigma_beta2 ~ normal(0, 2);
+  beta2_raw ~ normal(0, 1);
+
+  // Residual error
+  sigma ~ cauchy(0, 2.5);
+
+  // Likelihood
+  y ~ normal(mu, sigma);
+}
+
+generated quantities {
+  vector[N] log_lik;
+  for (i in 1:N) {
+    log_lik[i] = normal_lpdf(y[i] | mu[i], sigma);
+  }
+}
+"
+```
+
+```{r, eval=FALSE}
+stan_model_hier3 <- suppress_output(
+  stan_model(stanc_ret = stanc(model_code = stan_model_code_hier3))
+)
+
+fit_hier3 <- suppress_output(
+  sampling(
+    stan_model_hier3,
+    data = stan_data_extended,
+    iter = 2000,
+    chains = 1,
+    seed = 123,
+    refresh = 500
+  )
+)
+
+saveRDS(fit_hier3, "fit_hier3_ice_on.rds")
+```
+
+```{r}
+fit_hier3 <- readRDS("fit_hier3_ice_on.rds")
+
+# Get the actual country abbreviations from the data
+country_vars <- grep("^country_", names(data), value = TRUE)
+country_abbreviations <- gsub("country_", "", country_vars)
+
+# Prepare the parameter names using actual country abbreviations
+w_country_params <- paste0("w_country[", 1:length(country_abbreviations), "]")
+v_country_params <- paste0("v_country[", 1:length(country_abbreviations), "]")
+q_country_params <- paste0("q_country[", 1:length(country_abbreviations), "]")
+
+# Create meaningful parameter names
+w_country_named <- paste0("w_country[", country_abbreviations, "]")
+v_country_named <- paste0("v_country[", country_abbreviations, "]")
+q_country_named <- paste0("q_country[", country_abbreviations, "]")
+
+# Combine all parameters into one list for the summary
+summary_params <- c(
+  # Intercept regression
+  "w0", "w_area", "w_altitude", "w_latitude",
+  # Linear slope regression
+  "v0", "v_area", "v_altitude", "v_latitude",
+  # Quadratic slope regression
+  "q0", "q_area", "q_altitude", "q_latitude",
+  # Variance terms
+  "sigma", "sigma_beta0", "sigma_beta1", "sigma_beta2",
+  # Country effects with proper names
+  w_country_params, v_country_params, q_country_params
+)
+
+# Print the summary with the updated parameter names
+summary_output <- summary(fit_hier3, pars = summary_params)$summary
+rownames(summary_output)[grep("w_country\\[", rownames(summary_output))] <- w_country_named
+rownames(summary_output)[grep("v_country\\[", rownames(summary_output))] <- v_country_named
+rownames(summary_output)[grep("q_country\\[", rownames(summary_output))] <- q_country_named
+
+print(summary_output)
+
+# Traceplot with meaningful labels
+traceplot(fit_hier3, pars = summary_params, inc_warmup = FALSE)
+```
+
+```{r, echo=FALSE}
+# Extract posterior samples
+samples_hier3 <- rstan::extract(fit_hier3, pars = c(
+  # Global predictors
+  "w0", "w_area", "w_altitude", "w_latitude",
+  "v0", "v_area", "v_altitude", "v_latitude",
+  "q0", "q_area", "q_altitude", "q_latitude",
+  # Variance parameters
+  "sigma", "sigma_beta0", "sigma_beta1", "sigma_beta2",
+  # Country-level effects
+  "w_country", "v_country", "q_country"
+))
+
+# Extract actual country abbreviations
+country_vars <- grep("^country_", names(data), value = TRUE)
+country_abbreviations <- gsub("country_", "", country_vars)
+
+par(mfrow = c(4, 4), mar = c(4, 4, 2, 1))
+
+# Plotting function
+plot_posterior <- function(samples, name, xlab = name) {
+  if (length(samples) > 1) {  # Check if samples exist
+    plot(density(samples),
+         main = paste("Posterior of", name),
+         xlab = xlab,
+         col = "blue", lwd = 2)
+    abline(v = mean(samples), col = "red", lty = 2)
+  } else {
+    cat("No valid samples for:", name, "\n")
+  }
+}
+
+# Plot global parameters
+plot_posterior(samples_hier3$w0, "w0")
+plot_posterior(samples_hier3$w_area, "w_area", "log(area)")
+plot_posterior(samples_hier3$w_altitude, "w_altitude", "altitude")
+plot_posterior(samples_hier3$w_latitude, "w_latitude", "latitude")
+
+plot_posterior(samples_hier3$v0, "v0")
+plot_posterior(samples_hier3$v_area, "v_area", "log(area)")
+plot_posterior(samples_hier3$v_altitude, "v_altitude", "altitude")
+plot_posterior(samples_hier3$v_latitude, "v_latitude", "latitude")
+
+plot_posterior(samples_hier3$q0, "q0")
+plot_posterior(samples_hier3$q_area, "q_area", "log(area)")
+plot_posterior(samples_hier3$q_altitude, "q_altitude", "altitude")
+plot_posterior(samples_hier3$q_latitude, "q_latitude", "latitude")
+
+plot_posterior(samples_hier3$sigma, "sigma", "residual SD")
+plot_posterior(samples_hier3$sigma_beta0, "sigma_beta0", "intercept SD")
+plot_posterior(samples_hier3$sigma_beta1, "sigma_beta1", "linear slope SD")
+plot_posterior(samples_hier3$sigma_beta2, "sigma_beta2", "quadratic slope SD")
+
+# Plot country-specific parameters with proper abbreviations
+num_countries <- length(country_abbreviations)
+
+for (i in 1:num_countries) {
+  country_name <- country_abbreviations[i]
+  if (!is.null(samples_hier3$w_country)) {
+    if (i <= ncol(samples_hier3$w_country)) {
+      plot_posterior(samples_hier3$w_country[, i], paste0("w_country[", country_name, "]"))
+    } else {
+      cat("No data for:", paste0("w_country[", country_name, "]"), "\n")
+    }
+  }
+}
+for (i in 1:num_countries) {
+  country_name <- country_abbreviations[i]
+  if (!is.null(samples_hier3$v_country)) {
+    if (i <= ncol(samples_hier3$v_country)) {
+      plot_posterior(samples_hier3$v_country[, i], paste0("v_country[", country_name, "]"))
+    } else {
+      cat("No data for:", paste0("v_country[", country_name, "]"), "\n")
+    }
+  }
+}
+for (i in 1:num_countries) {
+  country_name <- country_abbreviations[i]
+  if (!is.null(samples_hier3$q_country)) {
+    if (i <= ncol(samples_hier3$q_country)) {
+      plot_posterior(samples_hier3$q_country[, i], paste0("q_country[", country_name, "]"))
+    } else {
+      cat("No data for:", paste0("q_country[", country_name, "]"), "\n")
+    }
+  }
+}
+```
+
+```{r, echo=FALSE}
+beta0_matrix <- rstan::extract(fit_hier3, pars = "beta0")$beta0
+beta1_matrix <- rstan::extract(fit_hier3, pars = "beta1")$beta1
+beta2_matrix <- rstan::extract(fit_hier3, pars = "beta2")$beta2
+
+beta0_means <- apply(beta0_matrix, 2, mean)
+beta1_means <- apply(beta1_matrix, 2, mean)
+beta2_means <- apply(beta2_matrix, 2, mean)
+
+par(mfrow = c(1, 3))
+
+plot(density(beta0_means),
+     main = "Smoothed intercepts",
+     xlab = expression(beta[0][i]),
+     col = "blue", lwd = 2)
+abline(v = mean(beta0_means), col = "red", lty = 2)
+
+plot(density(beta1_means),
+     main = "Smoothed slopes",
+     xlab = expression(beta[1][i]),
+     col = "blue", lwd = 2)
+abline(v = mean(beta1_means), col = "red", lty = 2)
+
+plot(density(beta2_means),
+     main = "Smoothed quadratic effects",
+     xlab = expression(beta[2][i]),
+     col = "blue", lwd = 2)
+abline(v = mean(beta2_means), col = "red", lty = 2)
+```
+
+```{r, echo=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Extract mean values for beta parameters from the fitted model
+beta0_means <- apply(rstan::extract(fit_hier3, pars = "beta0")$beta0, 2, mean)
+beta1_means <- apply(rstan::extract(fit_hier3, pars = "beta1")$beta1, 2, mean)
+beta2_means <- apply(rstan::extract(fit_hier3, pars = "beta2")$beta2, 2, mean)
+
+# Use the country variables directly from the merged_data, assuming it contains the country information
+if ("country" %in% colnames(merged_data)) {
+  country_info <- merged_data$country
+} else {
+  country_info <- "Unknown"
+}
+
+# Create a data frame for exploratory analysis
+exploratory_df <- data.frame(
+  beta0 = beta0_means,
+  beta1 = beta1_means,
+  beta2 = beta2_means,
+  latitude = data$lat_wgs84,
+  altitude = data$altitude_m,
+  log_area = log(data$area_ha),
+  country = country_info
+)
+
+# Reshape data for visualization
+exploratory_long <- exploratory_df %>%
+  pivot_longer(cols = c(beta0, beta1, beta2), names_to = "parameter", values_to = "value")
+
+# Plot 1: Lake-specific parameters vs Latitude
+ggplot(exploratory_long, aes(x = latitude, y = value, color = factor(country))) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, col = "black") +
+  facet_wrap(~ parameter, scales = "free_y", labeller = label_parsed) +
+  labs(title = "Lake-specific parameters vs Latitude by Country", 
+       y = expression(beta[i]), x = "Latitude", color = "Country") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Plot 2: Lake-specific parameters vs Altitude
+ggplot(exploratory_long, aes(x = altitude, y = value, color = factor(country))) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, col = "black") +
+  facet_wrap(~ parameter, scales = "free_y", labeller = label_parsed) +
+  labs(title = "Lake-specific parameters vs Altitude by Country", 
+       y = expression(beta[i]), x = "Altitude (m)", color = "Country") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Plot 3: Lake-specific parameters vs Log Area
+ggplot(exploratory_long, aes(x = log_area, y = value, color = factor(country))) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, col = "black") +
+  facet_wrap(~ parameter, scales = "free_y", labeller = label_parsed) +
+  labs(title = "Lake-specific parameters vs Log Area by Country", 
+       y = expression(beta[i]), x = "log(Area)", color = "Country") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r, echo=FALSE}
+data$country_label <- merged_data$country  # this works if row order is preserved
+
+country_df <- data.frame(
+  beta0 = beta0_means,
+  beta1 = beta1_means,
+  beta2 = beta2_means,
+  country = data$country_label
+)
+
+country_long <- country_df %>%
+  pivot_longer(cols = c(beta0, beta1, beta2), names_to = "parameter", values_to = "value")
+
+ggplot(country_long, aes(x = country, y = value, fill = country)) +
+  geom_violin(alpha = 0.7, draw_quantiles = c(0.5), color = "black") +
+  geom_jitter(width = 0.1, alpha = 0.04, size = 0.3, color = "black") +
+  facet_wrap(~parameter, scales = "free_y", labeller = label_parsed) +
+  labs(
+    title = "Lake-specific β Parameters by Country",
+    x = "Country",
+    y = expression(beta[i])
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    legend.position = "none"  # Hide legend since country is on x-axis
+  )
+```
+
+### Model Comparison:
+
+```{r, message=FALSE, warning=FALSE}
+library(loo)
+
+log_lik_simple <- extract_log_lik(fit_hier3, merge_chains = FALSE)
+
+loo_simple <- loo(log_lik_simple)
+print(loo_simple)
+
+cat("LOO Score for Simple Model:\n")
+cat("elpd_loo: ", loo_simple$estimates["elpd_loo", "Estimate"], "\n")
+cat("LOOIC: ", loo_simple$estimates["looic", "Estimate"], "\n")
+```
+
+```{r}
+library(dplyr)
+library(readr)
+
+beta0_means <- apply(rstan::extract(fit_hier3, pars = "beta0")$beta0, 2, mean)
+beta1_means <- apply(rstan::extract(fit_hier3, pars = "beta1")$beta1, 2, mean)
+beta2_means <- apply(rstan::extract(fit_hier3, pars = "beta2")$beta2, 2, mean)
+
+if ("country" %in% colnames(merged_data)) {
+  country_info <- merged_data$country
+} else {
+  country_info <- "Unknown"
+}
+
+export_df <- data.frame(
+  station_id = merged_data$station_id, # Taking station_id directly from merged data
+  year = merged_data$year,             # Including year for each measurement
+  beta0 = beta0_means,
+  beta1 = beta1_means,
+  beta2 = beta2_means,
+  latitude = data$lat_wgs84,
+  altitude = data$altitude_m,
+  log_area = log(data$area_ha),
+  country = country_info
+)
+
+write_csv(export_df, "lake_parameters_per_measurement.csv")
+
+cat("Export complete: lake_parameters_per_measurement.csv")
+```
