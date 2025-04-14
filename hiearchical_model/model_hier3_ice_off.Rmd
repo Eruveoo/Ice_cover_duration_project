@@ -462,73 +462,108 @@ library(ggplot2)
 library(dplyr)
 library(tidyr)
 
-# Extract mean values for beta parameters from the fitted model
 beta0_means <- apply(rstan::extract(fit_hier3, pars = "beta0")$beta0, 2, mean)
 beta1_means <- apply(rstan::extract(fit_hier3, pars = "beta1")$beta1, 2, mean)
 beta2_means <- apply(rstan::extract(fit_hier3, pars = "beta2")$beta2, 2, mean)
 
-# Use the country variables directly from the merged_data, assuming it contains the country information
-if ("country" %in% colnames(merged_data)) {
-  country_info <- merged_data$country
+if ("station_id" %in% colnames(merged_data)) { #Using station_id as lake_id
+  lake_ids <- unique(merged_data$station_id)
 } else {
-  country_info <- "Unknown"
+  stop("Error: 'station_id' column is missing from merged_data.  Cannot determine lakes.")
 }
 
-# Create a data frame for exploratory analysis
 exploratory_df <- data.frame(
-  beta0 = beta0_means,
-  beta1 = beta1_means,
-  beta2 = beta2_means,
-  latitude = data$lat_wgs84,
-  altitude = data$altitude_m,
-  log_area = log(data$area_ha),
-  country = country_info
+  lake_id = lake_ids,
+  beta0 = 0,
+  beta1 = 0,
+  beta2 = 0,
+  latitude = 0,
+  altitude = 0,
+  log_area = 0,
+  country = ""
 )
 
-# Reshape data for visualization
+for (i in 1:length(lake_ids)) {
+  current_lake_id <- lake_ids[i]
+  
+  lake_indices <- which(merged_data$station_id == current_lake_id)
+  
+  exploratory_df$beta0[i] <- beta0_means[lake_indices[1]]
+  exploratory_df$beta1[i] <- beta1_means[lake_indices[1]]
+  exploratory_df$beta2[i] <- beta2_means[lake_indices[1]]
+  
+  exploratory_df$latitude[i] <- mean(merged_data$lat_wgs84[lake_indices], na.rm = TRUE)
+  exploratory_df$altitude[i] <- mean(merged_data$altitude_m[lake_indices], na.rm = TRUE)
+  exploratory_df$log_area[i] <- mean(log(merged_data$area_ha[lake_indices]), na.rm = TRUE)
+  
+  exploratory_df$country[i] <- as.character(unique(merged_data$country[lake_indices])[1])
+}
+
 exploratory_long <- exploratory_df %>%
   pivot_longer(cols = c(beta0, beta1, beta2), names_to = "parameter", values_to = "value")
 
-# Plot 1: Lake-specific parameters vs Latitude
 ggplot(exploratory_long, aes(x = latitude, y = value, color = factor(country))) +
   geom_point(alpha = 0.6) +
-  geom_smooth(method = "loess", se = FALSE, col = "black") +
+  geom_smooth(method = "loess", se = FALSE, aes(color = factor(country))) + # Smooth lines by country
   facet_wrap(~ parameter, scales = "free_y", labeller = label_parsed) +
-  labs(title = "Lake-specific parameters vs Latitude by Country", 
+  labs(title = "Lake-specific parameters vs Latitude by Country",
        y = expression(beta[i]), x = "Latitude", color = "Country") +
   theme_minimal() +
   theme(legend.position = "bottom")
 
-# Plot 2: Lake-specific parameters vs Altitude
 ggplot(exploratory_long, aes(x = altitude, y = value, color = factor(country))) +
   geom_point(alpha = 0.6) +
-  geom_smooth(method = "loess", se = FALSE, col = "black") +
+  geom_smooth(method = "loess", se = FALSE, aes(color = factor(country))) + # Smooth lines by country
   facet_wrap(~ parameter, scales = "free_y", labeller = label_parsed) +
-  labs(title = "Lake-specific parameters vs Altitude by Country", 
+  labs(title = "Lake-specific parameters vs Altitude by Country",
        y = expression(beta[i]), x = "Altitude (m)", color = "Country") +
   theme_minimal() +
   theme(legend.position = "bottom")
 
-# Plot 3: Lake-specific parameters vs Log Area
 ggplot(exploratory_long, aes(x = log_area, y = value, color = factor(country))) +
   geom_point(alpha = 0.6) +
-  geom_smooth(method = "loess", se = FALSE, col = "black") +
+  geom_smooth(method = "loess", se = FALSE, aes(color = factor(country))) + # Smooth lines by country
   facet_wrap(~ parameter, scales = "free_y", labeller = label_parsed) +
-  labs(title = "Lake-specific parameters vs Log Area by Country", 
+  labs(title = "Lake-specific parameters vs Log Area by Country",
        y = expression(beta[i]), x = "log(Area)", color = "Country") +
   theme_minimal() +
   theme(legend.position = "bottom")
 ```
 
 ```{r, echo=FALSE}
-data$country_label <- merged_data$country  # this works if row order is preserved
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+beta0_means <- apply(rstan::extract(fit_hier3, pars = "beta0")$beta0, 2, mean)
+beta1_means <- apply(rstan::extract(fit_hier3, pars = "beta1")$beta1, 2, mean)
+beta2_means <- apply(rstan::extract(fit_hier3, pars = "beta2")$beta2, 2, mean)
+
+if ("station_id" %in% colnames(merged_data)) { #Using station_id as lake_id
+  lake_ids <- unique(merged_data$station_id)
+} else {
+  stop("Error: 'station_id' column is missing from merged_data.  Cannot determine lakes.")
+}
 
 country_df <- data.frame(
-  beta0 = beta0_means,
-  beta1 = beta1_means,
-  beta2 = beta2_means,
-  country = data$country_label
+  lake_id = lake_ids,
+  beta0 = 0,
+  beta1 = 0,
+  beta2 = 0,
+  country = ""
 )
+
+for (i in 1:length(lake_ids)) {
+  current_lake_id <- lake_ids[i]
+  
+  lake_indices <- which(merged_data$station_id == current_lake_id)
+  
+  country_df$beta0[i] <- beta0_means[lake_indices[1]]
+  country_df$beta1[i] <- beta1_means[lake_indices[1]]
+  country_df$beta2[i] <- beta2_means[lake_indices[1]]
+  
+  country_df$country[i] <- as.character(unique(merged_data$country[lake_indices])[1])
+}
 
 country_long <- country_df %>%
   pivot_longer(cols = c(beta0, beta1, beta2), names_to = "parameter", values_to = "value")
@@ -546,7 +581,7 @@ ggplot(country_long, aes(x = country, y = value, fill = country)) +
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1),
     panel.grid.major.x = element_blank(),
-    legend.position = "none"  # Hide legend since country is on x-axis
+    legend.position = "none"
   )
 ```
 
