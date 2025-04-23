@@ -188,7 +188,7 @@ def visualize_densities(prediction_density,
         except:
             print('Saving file did not succeed.')
 
-    plt.show()
+    #plt.show()
 
 
 
@@ -237,12 +237,22 @@ def combine_plot_images(density_path,ev_path,title=None,file_path=None,return_fi
 def short_mse_analysis(preds,true,return_variables=False):
     '''
     Inputs:
-    preds: Statsmodels predictions output.
-    true: The true target values in Patsy transformation format. 
-        This is the target 'y' which you used for modelling.
+        - preds: Statsmodels predictions output.
+        - true: The true target values in Patsy transformation format. 
+                This is the target 'y' which you used for modelling.
+        - return_variables: optional with default value as False.
+                If set True, function return a dictionary including:
+                * mse: calculated mse.
+                * SE_of_mse: standard error of MSE. 
+                  Note that standard error of MSE is not standard deviation of all squared errors.
+                * squared errors: a vector including all squared errors.
+                * 95%_lower: lower bound for normal based  95% confidence interval.
+                * 95%_upper: upper bound for normal based  95% confidence interval.
 
     Output:
-    Function prints short analysis about the squared error and its distribution.
+        - Function prints short analysis about the squared error and its distribution.
+        - If return_variables
+
     '''
     se_vec = (preds-true.values.reshape(len(true)))**2
     mse_from_vec =se_vec.mean()
